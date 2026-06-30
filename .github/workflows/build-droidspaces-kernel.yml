@@ -1,7 +1,6 @@
 name: Build Droidspaces Kernel for MT6895
 
 on:
-  # 手动触发
   workflow_dispatch:
     inputs:
       branch:
@@ -19,8 +18,12 @@ on:
         required: true
         default: true
         type: boolean
-  
-  # 推送到 lineage-21 分支时自动编译
+      create_release:
+        description: 'Create GitHub Release'
+        required: true
+        default: false
+        type: boolean
+
   push:
     branches:
       - lineage-21
@@ -33,161 +36,160 @@ on:
       - '.github/workflows/**'
 
 env:
-  KERNEL_REPO: xiaomi-mediatek-devs/android_kernel_xiaomi_mt6895
-  DROIDSPACES_PATCHES_REPO: ravindu644/Droidspaces-OSS
-  CLANG_VERSION: r450784d  # Android 14 / LineageOS 21 推荐的 Clang 版本
-  ANYKERNEL_REPO: osm0sis/AnyKernel3
+  WORKSPACE: ${{ github.workspace }}
+  KERNEL_DIR: ${{ github.workspace }}/kernel
+  TOOLS_DIR: ${{ github.workspace }}/tools
+  OUT_DIR: ${{ github.workspace }}/out
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
-    
+    timeout-minutes: 180
+
     steps:
-      # ========== 1. 设置环境 ==========
-      - name: Setup build environment
+      # ========== 1. 安装系统依赖 ==========
+      - name: Install system dependencies
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl flex \
             g++-multilib gcc-multilib git gnupg gperf \
-            lib32ncurses5-dev lib32z1-dev libelf-dev \
-            liblz4-tool libncurses5-dev libsdl1.2-dev \
-            libssl-dev libxml2 libxml2-utils lzop \
-            pngcrush rsync schedtool squashfs-tools \
-            xsltproc zip zlib1g-dev \
-            libwxgtk3.0-gtk3-dev 2>/dev/null || true
-          
-          # 创建工作目录
-          mkdir -p ~/kernel-workspace
-          cd ~/kernel-workspace
+            imagemagick lib32readline-dev lib32z1-dev \
+            libelf-dev liblz4-tool libncurses5-dev \
+            libncurses5 libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush \
+            rsync schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev libwxgtk3.0-gtk3-dev \
+            libncurses-dev python3 python3-pip \
+            device-tree-compiler libfdt-dev \
+            libglib2.0-dev libpixman-1-dev \
+            ninja-build
 
-      # ========== 2. 克隆内核源码 ==========
-      - name: Clone kernel source
+      # ========== 2. 克隆工具链（Git 方式） ==========
+      - name: Clone Clang toolchain (Git)
         run: |
-          cd ~/kernel-workspace
-          git clone --depth=1 -b ${{ github.event.inputs.branch || 'lineage-21' }} \
-            https://github.com/${{ env.KERNEL_REPO }}.git kernel
-          cd kernel
-          echo "KERNEL_PATH=$(pwd)" >> $GITHUB_ENV
-          echo "Kernel source cloned successfully"
+          mkdir -p ${{ env.TOOLS_DIR }}
+          cd ${{ env.TOOLS_DIR }}
 
-      # ========== 3. 克隆工具链 ==========
-      - name: Setup Clang toolchain
-        run: |
-          cd ~/kernel-workspace
-          
-          # 下载 Google 预编译 Clang
-          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-${{ env.CLANG_VERSION }}.tar.gz"
-          
-          mkdir -p clang
-          cd clang
-          
-          # 使用 wget 下载（带重试）
-          wget --tries=3 --timeout=60 "$CLANG_URL" -O clang.tar.gz || {
-            echo "Failed to download clang, trying alternative..."
-            # 备用：使用 AOSP 通用工具链
-            git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r450784d.git clang-r450784d 2>/dev/null || \
-            git clone --depth=1 https://gitlab.com/ImSurajxD/clang-r450784d.git clang-r450784d
-          }
-          
-          if [ -f clang.tar.gz ]; then
-            tar -xzf clang.tar.gz
-            CLANG_DIR=$(pwd)
-          else
-            CLANG_DIR=$(pwd)/clang-r450784d
+          # 方式1: 克隆 LineageOS 预编译 Clang
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r450784d.git \
+            clang-r450784d 2>/dev/null || true
+
+          # 如果失败，尝试备用仓库
+          if [ ! -d "clang-r450784d/bin" ]; then
+            rm -rf clang-r450784d
+            git clone --depth=1 \
+              https://gitlab.com/ImSurajxD/clang-r450784d.git \
+              clang-r450784d 2>/dev/null || true
           fi
-          
-          echo "CLANG_PATH=$CLANG_DIR" >> $GITHUB_ENV
-          echo "Clang setup complete: $CLANG_DIR"
 
-      # ========== 4. 下载 GCC 工具链（备用） ==========
-      - name: Setup GCC toolchain
+          # 如果还是失败，使用 AOSP master 分支的 Clang
+          if [ ! -d "clang-r450784d/bin" ]; then
+            rm -rf clang-r450784d
+            git clone --depth=1 \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+              clang-repo
+            # 找到最新的 clang 目录
+            CLANG_SUBDIR=$(ls clang-repo/ | grep clang | sort | tail -1)
+            mv "clang-repo/$CLANG_SUBDIR" clang-r450784d
+          fi
+
+          echo "CLANG_PATH=${{ env.TOOLS_DIR }}/clang-r450784d" >> $GITHUB_ENV
+          echo "Clang path: ${{ env.TOOLS_DIR }}/clang-r450784d"
+          ls -la ${{ env.TOOLS_DIR }}/clang-r450784d/bin/ | head -10
+
+      - name: Clone GCC toolchain (Git)
         run: |
-          cd ~/kernel-workspace
-          mkdir -p gcc
-          cd gcc
-          
-          # 下载 aarch64-linux-android 工具链
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git aarch64-linux-android-4.9
-          
-          echo "GCC_PATH=$(pwd)/aarch64-linux-android-4.9" >> $GITHUB_ENV
+          cd ${{ env.TOOLS_DIR }}
+
+          # aarch64-linux-android GCC 4.9
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            gcc-aarch64 2>/dev/null || \
+          git clone --depth=1 \
+            https://github.com/akhilnarang/gcc-prebuilts-aarch64.git \
+            gcc-aarch64
+
+          # arm-linux-androideabi GCC 4.9
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
+            gcc-arm 2>/dev/null || \
+          git clone --depth=1 \
+            https://github.com/akhilnarang/gcc-prebuilts-arm.git \
+            gcc-arm
+
+          echo "GCC_AARCH64_PATH=${{ env.TOOLS_DIR }}/gcc-aarch64" >> $GITHUB_ENV
+          echo "GCC_ARM_PATH=${{ env.TOOLS_DIR }}/gcc-arm" >> $GITHUB_ENV
+
+      # ========== 3. 配置 ccache ==========
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.workflow }}-${{ github.event.inputs.branch || 'lineage-21' }}
+          max-size: 10G
+
+      # ========== 4. 克隆内核源码 ==========
+      - name: Clone kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: xiaomi-mediatek-devs/android_kernel_xiaomi_mt6895
+          ref: ${{ github.event.inputs.branch || 'lineage-21' }}
+          path: kernel
+          fetch-depth: 1
 
       # ========== 5. 克隆 Droidspaces 补丁 ==========
       - name: Clone Droidspaces patches
         if: ${{ github.event.inputs.apply_droidspaces_patches != 'false' }}
         run: |
-          cd ~/kernel-workspace
-          git clone --depth=1 https://github.com/${{ env.DROIDSPACES_PATCHES_REPO }}.git droidspaces
-          echo "DROIDSPACES_PATH=$(pwd)/droidspaces" >> $GITHUB_ENV
+          cd ${{ env.WORKSPACE }}
+          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git droidspaces
+          echo "DROIDSPACES_PATH=${{ env.WORKSPACE }}/droidspaces" >> $GITHUB_ENV
 
       # ========== 6. 应用 Droidspaces kABI 补丁 ==========
       - name: Apply Droidspaces kABI patches
         if: ${{ github.event.inputs.apply_droidspaces_patches != 'false' }}
         run: |
-          cd $KERNEL_PATH
-          
-          echo "=== Applying Droidspaces kABI patches for GKI 5.10 ==="
-          
-          # 补丁 1: SYSVIPC kABI fix (所有低于 6.12 的 GKI 都需要)
-          PATCH1="$DROIDSPACES_PATH/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix-sysvipc-kabi.patch"
+          cd ${{ env.KERNEL_DIR }}
+
+          echo "=== Kernel version check ==="
+          head -5 Makefile
+
+          echo "=== Applying Droidspaces kABI patches ==="
+
+          # 补丁1: SYSVIPC kABI fix
+          PATCH1="${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix-sysvipc-kabi.patch"
           if [ -f "$PATCH1" ]; then
             echo "Applying: 001.GKI-below-6.12-fix-sysvipc-kabi.patch"
-            patch -p1 < "$PATCH1" || { echo "Patch 1 failed"; exit 1; }
+            patch -p1 --verbose < "$PATCH1"
           else
             echo "ERROR: Patch 1 not found at $PATCH1"
+            ls -R "${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches/" || true
             exit 1
           fi
-          
-          # 补丁 2: POSIX_MQUEUE kABI fix (仅 5.10 及以下)
-          PATCH2="$DROIDSPACES_PATH/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
+
+          # 补丁2: POSIX_MQUEUE kABI fix (5.10 及以下)
+          PATCH2="${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
           if [ -f "$PATCH2" ]; then
             echo "Applying: 002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
-            patch -p1 < "$PATCH2" || { echo "Patch 2 failed"; exit 1; }
+            patch -p1 --verbose < "$PATCH2"
           else
             echo "ERROR: Patch 2 not found at $PATCH2"
             exit 1
           fi
-          
-          echo "=== All patches applied successfully ==="
 
-      # ========== 7. 修改内核配置（启用 Droidspaces 支持） ==========
-      - name: Enable Droidspaces kernel config
+          echo "=== Patches applied successfully ==="
+
+      # ========== 7. 修改内核配置 ==========
+      - name: Enable Droidspaces kernel configs
         if: ${{ github.event.inputs.apply_droidspaces_patches != 'false' }}
         run: |
-          cd $KERNEL_PATH
-          
-          # 找到 GKI defconfig
-          DEFCONFIG=$(find arch/arm64/configs -name "gki_defconfig" | head -1)
+          cd ${{ env.KERNEL_DIR }}
+
+          # 查找 GKI defconfig
+          DEFCONFIG=$(find arch/arm64/configs -maxdepth 1 -name "gki_defconfig" | head -1)
           if [ -z "$DEFCONFIG" ]; then
-            # 尝试其他可能的 defconfig 名称
-            DEFCONFIG=$(find arch/arm64/configs -name "*defconfig" | grep -i gki | head -1)
+            DEFCONFIG=$(find arch/arm64/configs -maxdepth 1 -name "*defconfig" | head -1)
           fi
-          
-          if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: Could not find gki_defconfig"
-            ls -la arch/arm64/configs/
-            exit 1
-          fi
-          
-          echo "Using defconfig: $DEFCONFIG"
-          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
-          
-          # 定义需要启用的配置项
-          declare -A CONFIGS=(
-            ["CONFIG_SYSVIPC"]="y"
-            ["CONFIG_POSIX_MQUEUE"]="y"
-            ["CONFIG_IPC_NS"]="y"
-            ["CONFIG_PID_NS"]="y"
-            ["CONFIG_DEVTMPFS"]="y"
-            ["CONFIG_NETFILTER_XT_MATCH_ADDRTYPE"]="y"
-            ["CONFIG_TMPFS_POSIX_ACL"]="y"
-            ["CONFIG_TMPFS_XATTR"]="y"
-          )
-          
-          for config in "${!CONFIGS[@]}"; do
-            value="${CONFIGS[$config]}"
-            if grep -q "^# $config is not set" "$DEFCONFIG"; then
-              sed -i "s/^# $config is not set/$config=$value/" "$DEFCONFIG"
-              echo "Enabled: $config=$value"
-            elif grep -q "^$config
+
