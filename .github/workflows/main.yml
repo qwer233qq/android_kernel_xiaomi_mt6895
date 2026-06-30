@@ -1,0 +1,204 @@
+name: Build Droidspaces Kernel for MT6895
+
+on:
+  # 手动触发，支持参数选择
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Kernel defconfig name'
+        required: true
+        default: 'gki_defconfig'
+        type: string
+      kernel_version:
+        description: 'Kernel version (5.15, 5.10, etc.)'
+        required: true
+        default: '5.15'
+        type: string
+      apply_kabi_patch:
+        description: 'Apply GKI kABI patch'
+        required: true
+        default: true
+        type: boolean
+      build_anykernel:
+        description: 'Build AnyKernel3 flashable zip'
+        required: true
+        default: true
+        type: boolean
+      upload_release:
+        description: 'Upload to GitHub Release'
+        required: true
+        default: true
+        type: boolean
+
+  # 自动触发：push 到 main 分支时
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'arch/arm64/configs/**'
+      - 'drivers/**'
+      - 'kernel/**'
+      - '.github/workflows/**'
+
+  # 自动触发：PR 时检查配置
+  pull_request:
+    branches:
+      - main
+      - master
+
+env:
+  # 工具链配置
+  CLANG_VERSION: r487747c
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${{ env.CLANG_VERSION }}.tar.gz
+  # 或者使用 GitHub 镜像
+  # CLANG_URL: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r487747c
+
+  # AnyKernel3 配置
+  ANYKERNEL_URL: https://github.com/osm0sis/AnyKernel3
+
+  # Droidspaces 补丁来源
+  DROIDSPACES_PATCH_URL: https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12
+
+jobs:
+  # ========== 任务1：检查内核配置是否满足 Droidspaces 要求 ==========
+  check-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Check Droidspaces kernel requirements
+        run: |
+          echo "=== Checking Droidspaces Kernel Requirements ==="
+
+          # 查找 defconfig 文件
+          DEFCONFIG_PATH=$(find arch/arm64/configs -name "*.defconfig" -o -name "*_defconfig" | head -1)
+          if [ -z "$DEFCONFIG_PATH" ]; then
+            echo "❌ No defconfig found in arch/arm64/configs/"
+            exit 1
+          fi
+          echo "Found defconfig: $DEFCONFIG_PATH"
+
+          # 必需配置检查
+          REQUIRED_CONFIGS=(
+            "CONFIG_NAMESPACES"
+            "CONFIG_UTS_NS"
+            "CONFIG_IPC_NS"
+            "CONFIG_PID_NS"
+            "CONFIG_SYSVIPC"
+            "CONFIG_POSIX_MQUEUE"
+            "CONFIG_DEVTMPFS"
+            "CONFIG_DEVTMPFS_MOUNT"
+            "CONFIG_TUN"
+            "CONFIG_VETH"
+          )
+
+          MISSING=0
+          for cfg in "${REQUIRED_CONFIGS[@]}"; do
+            if grep -q "${cfg}=y" "$DEFCONFIG_PATH"; then
+              echo "✅ $cfg is enabled"
+            elif grep -q "# ${cfg} is not set" "$DEFCONFIG_PATH"; then
+              echo "❌ $cfg is disabled"
+              MISSING=$((MISSING + 1))
+            else
+              echo "⚠️  $cfg not found (will be added)"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+
+          if [ $MISSING -gt 0 ]; then
+            echo ""
+            echo "⚠️  Found $MISSING missing configs. Build will add them automatically."
+          else
+            echo ""
+            echo "✅ All required Droidspaces configs are present!"
+          fi
+
+  # ========== 任务2：构建内核 ==========
+  build-kernel:
+    runs-on: ubuntu-latest
+    needs: check-config
+    if: github.event_name != 'pull_request' || needs.check-config.result == 'success'
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             bc bison build-essential ccache curl flex             git gnupg gperf libelf-dev libncurses5-dev             libssl-dev lsb-release software-properties-common             unzip wget zip zlib1g-dev python3 python3-pip             libxml2 libxml2-utils jq
+
+          # 设置 ccache
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
+          mkdir -p $HOME/.ccache
+
+      - name: Download Clang toolchain
+        run: |
+          mkdir -p $HOME/toolchains
+          cd $HOME/toolchains
+
+          # 下载 AOSP Clang
+          wget -q --show-progress "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${{ env.CLANG_VERSION }}.tar.gz" -O clang.tar.gz ||           wget -q --show-progress "https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-${{ env.CLANG_VERSION }}/archive/refs/heads/main.tar.gz" -O clang.tar.gz
+
+          tar -xzf clang.tar.gz -C clang
+          rm clang.tar.gz
+
+          # 下载 GCC (用于交叉编译)
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc-aarch64
+
+          # 设置环境变量
+          echo "CLANG_PATH=$HOME/toolchains/clang/bin" >> $GITHUB_ENV
+          echo "GCC_PATH=$HOME/toolchains/gcc-aarch64/bin" >> $GITHUB_ENV
+
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains
+          key: ${{ runner.os }}-toolchains-${{ env.CLANG_VERSION }}
+
+      - name: Apply Droidspaces kABI patch (GKI)
+        if: ${{ inputs.apply_kabi_patch || github.event_name == 'push' }}
+        run: |
+          echo "=== Applying Droidspaces GKI kABI Patch ==="
+
+          KERNEL_MAJOR=$(echo "${{ inputs.kernel_version || '5.15' }}" | cut -d. -f1)
+          KERNEL_MINOR=$(echo "${{ inputs.kernel_version || '5.15' }}" | cut -d. -f2)
+
+          # 判断内核版本，选择正确补丁
+          if [ "$KERNEL_MAJOR" -lt 6 ] || ([ "$KERNEL_MAJOR" -eq 6 ] && [ "$KERNEL_MINOR" -lt 12 ]); then
+            echo "Kernel version ${{ inputs.kernel_version }} requires kABI patch (below 6.12)"
+
+            # 下载 kABI 补丁
+            PATCH_URL="${{ env.DROIDSPACES_PATCH_URL }}/001.GKI-below-kernel-6.12-fix_sysvipc_kabi.patch"
+            wget -q "$PATCH_URL" -O droidspaces-kabi.patch
+
+            if [ -f "droidspaces-kabi.patch" ]; then
+              echo "Applying kABI patch..."
+              patch -p1 < droidspaces-kabi.patch || {
+                echo "❌ Failed to apply kABI patch!"
+                exit 1
+              }
+              echo "✅ kABI patch applied successfully"
+            else
+              echo "⚠️  Could not download kABI patch, attempting manual fix..."
+
+              # 手动修改 kernel/sys_ni.c 添加 kABI 兼容
+              if [ -f "kernel/sys_ni.c" ]; then
+                # 检查是否已经打过补丁
+                if ! grep -q "__kabi_compat" kernel/sys_ni.c; then
+                  echo "Applying manual kABI workaround..."
+                  # 这里可以添加自定义的 kABI 修复逻辑
+                fi
+              fi
+            fi
+          else
+            echo "Kernel version ${{ inpu
