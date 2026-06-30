@@ -1,0 +1,179 @@
+name: Build Xiaomi MT6895 Kernel with Droidspaces Support
+
+on:
+  push:
+    branches: [ main, master, "**" ]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - 'LICENSE'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      defconfig:
+        description: 'Defconfig file name'
+        required: true
+        default: 'gki_defconfig'
+      add_kernelsu:
+        description: 'Add KernelSU support'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  # Droidspaces 配置
+  DROIDSPACES_REPO: https://github.com/ravindu644/Droidspaces-OSS
+  # 工具链
+  CLANG_VERSION: r487747c
+  GCC_AARCH64_VERSION: 4.9
+  GCC_ARM_VERSION: 4.9
+  # 构建参数
+  ARCH: arm64
+  SUBARCH: arm64
+  # 设备配置
+  DEVICE: mt6895
+  KERNEL_VERSION: "5.10"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+    # ============================================================
+    # 1. 检出内核源码
+    # ============================================================
+    - name: Checkout Kernel Source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        submodules: recursive
+
+    # ============================================================
+    # 2. 设置构建环境
+    # ============================================================
+    - name: Setup Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y           bc bison build-essential ccache curl flex           git gnupg gperf imagemagick lib32ncurses5-dev           lib32readline-dev lib32z1-dev liblz4-tool           libncurses5-dev libsdl1.2-dev libssl-dev           libxml2 libxml2-utils lzop pngcrush           rsync schedtool squashfs-tools xsltproc zip           zlib1g-dev libelf-dev libncurses-dev           binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu           python3 python3-pip
+
+        # 安装 repo 工具
+        mkdir -p ~/.bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+        chmod a+rx ~/.bin/repo
+        echo "$HOME/.bin" >> $GITHUB_PATH
+
+    # ============================================================
+    # 3. 下载并配置 Clang 工具链
+    # ============================================================
+    - name: Download Clang Toolchain
+      run: |
+        mkdir -p $HOME/toolchains
+        cd $HOME/toolchains
+
+        # 下载 AOSP Clang
+        CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${{ env.CLANG_VERSION }}.tar.gz"
+        wget -q --show-progress "$CLANG_URL" -O clang.tar.gz || true
+
+        if [ ! -f clang.tar.gz ] || [ ! -s clang.tar.gz ]; then
+          echo "Downloading from alternative source..."
+          wget -q --show-progress "https://github.com/LineageOS/android_prebuilts_clang_host_linux-x86/archive/refs/heads/lineage-20.0.tar.gz" -O clang.tar.gz
+        fi
+
+        tar -xzf clang.tar.gz -C clang 2>/dev/null || true
+
+        # 下载 GCC 工具链
+        wget -q --show-progress "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-${{ env.GCC_AARCH64_VERSION }}/+archive/refs/heads/main.tar.gz" -O gcc-aarch64.tar.gz || true
+        mkdir -p gcc-aarch64
+        tar -xzf gcc-aarch64.tar.gz -C gcc-aarch64 2>/dev/null || true
+
+        wget -q --show-progress "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-${{ env.GCC_ARM_VERSION }}/+archive/refs/heads/main.tar.gz" -O gcc-arm.tar.gz || true
+        mkdir -p gcc-arm
+        tar -xzf gcc-arm.tar.gz -C gcc-arm 2>/dev/null || true
+
+        ls -la $HOME/toolchains/
+
+    # ============================================================
+    # 4. 下载 Droidspaces 补丁和配置
+    # ============================================================
+    - name: Download Droidspaces Resources
+      run: |
+        cd $HOME
+        git clone --depth 1 ${{ env.DROIDSPACES_REPO }} droidspaces-oss
+
+        echo "=== Droidspaces 资源下载完成 ==="
+        ls -la droidspaces-oss/Documentation/resources/kernel-patches/
+
+        # 列出可用的补丁
+        echo "=== 可用的 GKI 补丁 (5.10 内核) ==="
+        find droidspaces-oss/Documentation/resources/kernel-patches/GKI -name "*.patch" | sort
+
+        echo "=== 可用的 Non-GKI 补丁 ==="
+        find droidspaces-oss/Documentation/resources/kernel-patches/non-GKI -name "*.patch" | sort 2>/dev/null || echo "Non-GKI 补丁目录不存在"
+
+    # ============================================================
+    # 5. 应用 Droidspaces 内核补丁
+    # ============================================================
+    - name: Apply Droidspaces Kernel Patches
+      run: |
+        cd ${{ github.workspace }}
+
+        KERNEL_MAJOR=$(echo ${{ env.KERNEL_VERSION }} | cut -d. -f1)
+        KERNEL_MINOR=$(echo ${{ env.KERNEL_VERSION }} | cut -d. -f2)
+
+        echo "=== 内核版本: ${{ env.KERNEL_VERSION }} (major=$KERNEL_MAJOR, minor=$KERNEL_MINOR) ==="
+
+        # 判断是 GKI 还是 Non-GKI 内核
+        # MT6895 使用 5.10 内核，属于 GKI 内核
+        if [ "$KERNEL_MAJOR" -ge 5 ] && [ "$KERNEL_MINOR" -ge 4 ]; then
+          echo "=== 检测到 GKI 内核，应用 GKI 补丁 ==="
+
+          # 应用 SYSVIPC kABI 修复补丁 (5.4-6.11)
+          SYSVIPC_PATCH="$HOME/droidspaces-oss/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-kernel-6.12-fix_sysvipc_kabi.patch"
+          if [ -f "$SYSVIPC_PATCH" ]; then
+            echo "应用 SYSVIPC kABI 补丁..."
+            patch -p1 --no-backup-if-mismatch < "$SYSVIPC_PATCH" || echo "补丁可能已应用或不需要"
+          else
+            echo "警告: SYSVIPC 补丁未找到"
+          fi
+
+          # 5.10 及以下还需要 POSIX_MQUEUE 补丁
+          if [ "$KERNEL_MINOR" -le 10 ]; then
+            POSIX_PATCH="$HOME/droidspaces-oss/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
+            if [ -f "$POSIX_PATCH" ]; then
+              echo "应用 POSIX_MQUEUE kABI 补丁..."
+              patch -p1 --no-backup-if-mismatch < "$POSIX_PATCH" || echo "补丁可能已应用或不需要"
+            else
+              echo "警告: POSIX_MQUEUE 补丁未找到"
+            fi
+          fi
+
+          # 应用 Docker overlay2 on f2fs 补丁
+          DOCKER_PATCH=$(find $HOME/droidspaces-oss/Documentation/resources/kernel-patches -name "*docker*overlay*" -o -name "*f2fs*" | head -1)
+          if [ -n "$DOCKER_PATCH" ] && [ -f "$DOCKER_PATCH" ]; then
+            echo "应用 Docker/F2FS 补丁: $DOCKER_PATCH"
+            patch -p1 --no-backup-if-mismatch < "$DOCKER_PATCH" || echo "补丁可能已应用或不需要"
+          fi
+
+        else
+          echo "=== 检测到 Non-GKI 内核，应用 Non-GKI 补丁 ==="
+          for patch in $HOME/droidspaces-oss/Documentation/resources/kernel-patches/non-GKI/*.patch; do
+            if [ -f "$patch" ]; then
+              echo "应用补丁: $patch"
+              patch -p1 --no-backup-if-mismatch < "$patch" || echo "补丁可能已应用或不需要"
+            fi
+          done
+        fi
+
+        echo "=== 补丁应用完成 ==="
+
+    # ============
