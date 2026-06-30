@@ -193,3 +193,211 @@ jobs:
             DEFCONFIG=$(find arch/arm64/configs -maxdepth 1 -name "*defconfig" | head -1)
           fi
 
+          if [ -z "$DEFCONFIG" ]; then
+            echo "ERROR: No defconfig found!"
+            ls -la arch/arm64/configs/
+            exit 1
+          fi
+
+          echo "Using defconfig: $DEFCONFIG"
+          echo "DEFCONFIG_PATH=$DEFCONFIG" >> $GITHUB_ENV
+
+          # 定义 Droidspaces 必需配置
+          CONFIGS=(
+            "CONFIG_SYSVIPC=y"
+            "CONFIG_POSIX_MQUEUE=y"
+            "CONFIG_IPC_NS=y"
+            "CONFIG_PID_NS=y"
+            "CONFIG_DEVTMPFS=y"
+            "CONFIG_CGROUP_DEVICE=y"
+            "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
+            "CONFIG_TMPFS_POSIX_ACL=y"
+            "CONFIG_TMPFS_XATTR=y"
+          )
+
+          for cfg in "${CONFIGS[@]}"; do
+            KEY=$(echo "$cfg" | cut -d= -f1)
+            VAL=$(echo "$cfg" | cut -d= -f2)
+
+            if grep -q "^# $KEY is not set" "$DEFCONFIG"; then
+              sed -i "s/^# $KEY is not set/$KEY=$VAL/" "$DEFCONFIG"
+              echo "  ✅ Enabled: $KEY=$VAL"
+            elif grep -q "^$KEY=" "$DEFCONFIG"; then
+              sed -i "s/^$KEY=.*/$KEY=$VAL/" "$DEFCONFIG"
+              echo "  🔄 Updated: $KEY=$VAL"
+            else
+              echo "$KEY=$VAL" >> "$DEFCONFIG"
+              echo "  ➕ Added: $KEY=$VAL"
+            fi
+          done
+
+          echo ""
+          echo "=== Verifying configs ==="
+          for cfg in "${CONFIGS[@]}"; do
+            KEY=$(echo "$cfg" | cut -d= -f1)
+            grep "^$KEY=" "$DEFCONFIG" || echo "  ⚠️  $KEY not found!"
+          done
+
+      # ========== 8. 编译内核 ==========
+      - name: Build kernel
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+
+          # 设置环境变量
+          export PATH=${{ env.CLANG_PATH }}/bin:$PATH
+          export CC=clang
+          export CXX=clang++
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          # 添加 GCC 到 PATH（用于链接器）
+          export PATH=${{ env.GCC_AARCH64_PATH }}/bin:${{ env.GCC_ARM_PATH }}/bin:$PATH
+
+          # ccache 配置
+          export CCACHE_COMPRESS=1
+          export CCACHE_MAXSIZE=10G
+          export CCACHE_DIR=${{ env.WORKSPACE }}/.ccache
+
+          echo "=== Toolchain Info ==="
+          clang --version | head -2
+          aarch64-linux-android-gcc --version | head -1 2>/dev/null || echo "GCC linker not available"
+
+          echo ""
+          echo "=== Starting build ==="
+          make clean 2>/dev/null || true
+
+          # 使用 defconfig
+          DEFCONFIG_NAME=$(basename ${{ env.DEFCONFIG_PATH }})
+          make ARCH=$ARCH $DEFCONFIG_NAME
+
+          # 编译
+          make ARCH=$ARCH \
+            CC="ccache clang" \
+            CXX="ccache clang++" \
+            AR="llvm-ar" \
+            NM="llvm-nm" \
+            STRIP="llvm-strip" \
+            OBJCOPY="llvm-objcopy" \
+            OBJDUMP="llvm-objdump" \
+            READELF="llvm-readelf" \
+            HOSTCC="ccache clang" \
+            HOSTCXX="ccache clang++" \
+            HOSTAR="llvm-ar" \
+            -j$(nproc) 2>&1 | tee ${{ env.OUT_DIR }}/build.log
+
+          # 检查输出
+          mkdir -p ${{ env.OUT_DIR }}
+          if [ -f "arch/arm64/boot/Image.gz" ]; then
+            cp arch/arm64/boot/Image.gz ${{ env.OUT_DIR }}/
+            echo "KERNEL_IMAGE=${{ env.OUT_DIR }}/Image.gz" >> $GITHUB_ENV
+            echo "✅ Image.gz built successfully"
+          elif [ -f "arch/arm64/boot/Image" ]; then
+            cp arch/arm64/boot/Image ${{ env.OUT_DIR }}/
+            echo "KERNEL_IMAGE=${{ env.OUT_DIR }}/Image" >> $GITHUB_ENV
+            echo "✅ Image built successfully"
+          else
+            echo "❌ Kernel image not found!"
+            tail -100 ${{ env.OUT_DIR }}/build.log
+            exit 1
+          fi
+
+          # 复制 DTB（如果有）
+          if [ -f "arch/arm64/boot/dts/mediatek/mt6895.dtb" ]; then
+            cp arch/arm64/boot/dts/mediatek/mt6895.dtb ${{ env.OUT_DIR }}/
+          fi
+
+      # ========== 9. 打包 AnyKernel3 ==========
+      - name: Package AnyKernel3
+        run: |
+          cd ${{ env.WORKSPACE }}
+
+          # 克隆 AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+
+          cd anykernel
+
+          # 复制内核
+          if [ -f "${{ env.OUT_DIR }}/Image.gz" ]; then
+            cp ${{ env.OUT_DIR }}/Image.gz .
+          elif [ -f "${{ env.OUT_DIR }}/Image" ]; then
+            cp ${{ env.OUT_DIR }}/Image .
+          fi
+
+          # 复制 DTB
+          if [ -f "${{ env.OUT_DIR }}/mt6895.dtb" ]; then
+            mkdir -p dtb
+            cp ${{ env.OUT_DIR }}/mt6895.dtb dtb/
+          fi
+
+          # 创建 anykernel.sh
+          cat > anykernel.sh << 'AKEOF'
+          # AnyKernel3 Ramdisk Mod Script
+          # osm0sis @ xda-developers
+
+          properties() { '
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=pearl
+          device.name2=pearl
+          supported.versions=14
+          supported.patchlevels=
+          '; }
+
+          . /tmp/anykernel/tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          AKEOF
+
+          # 打包
+          ZIP_NAME="Droidspaces-Kernel-MT6895-$(date +%Y%m%d)-${{ github.run_number }}.zip"
+          zip -r9 ${{ env.OUT_DIR }}/$ZIP_NAME *
+
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "✅ Packaged: $ZIP_NAME"
+
+      # ========== 10. 上传产物 ==========
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-mt6895-${{ github.run_number }}
+          path: |
+            ${{ env.OUT_DIR }}/*.zip
+            ${{ env.OUT_DIR }}/Image*
+            ${{ env.OUT_DIR }}/build.log
+          retention-days: 30
+
+      # ========== 11. 创建 Release ==========
+      - name: Create Release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: droidspaces-mt6895-${{ github.run_number }}
+          name: Droidspaces Kernel MT6895 #${{ github.run_number }}
+          body: |
+            ## Droidspaces Kernel for Redmi Note 12T Pro (MT6895)
+
+            **Build**: #${{ github.run_number }}
+            **Branch**: ${{ github.event.inputs.branch || 'lineage-21' }}
+            **Date**: $(date +%Y-%m-%d)
+
+            ### Enabled Features
+            - ✅ PID namespace
+            - ✅ IPC namespace
+            - ✅ devtmpfs
+            - ✅ SYSVIPC / POSIX_MQUEUE
+            - ✅ kABI patches applied
+
+            ### Flashing
+            Flash `Droidspaces-Kernel-MT6895-*.zip` via TWRP/Recovery
+          files: |
+            ${{ env.OUT_DIR }}/*.zip
+          draft: true
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
