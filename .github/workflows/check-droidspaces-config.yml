@@ -1,0 +1,82 @@
+name: Check Droidspaces Kernel Config
+
+on:
+  push:
+    branches: [lineage-21, lineage-22.*]
+    paths:
+      - 'arch/arm64/configs/**'
+  pull_request:
+    branches: [lineage-21, lineage-22.*]
+    paths:
+      - 'arch/arm64/configs/**'
+
+jobs:
+  check-config:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+
+      - name: Check Droidspaces required configs
+        run: |
+          echo "=== Checking Droidspaces Kernel Requirements ==="
+          
+          # 定义必需配置
+          REQUIRED_CONFIGS=(
+            "CONFIG_PID_NS"
+            "CONFIG_IPC_NS"
+            "CONFIG_DEVTMPFS"
+            "CONFIG_CGROUP_DEVICE"
+            "CONFIG_SYSVIPC"
+            "CONFIG_POSIX_MQUEUE"
+            "CONFIG_NAMESPACES"
+            "CONFIG_UTS_NS"
+            "CONFIG_MNT_NS"
+            "CONFIG_NET_NS"
+            "CONFIG_VETH"
+            "CONFIG_BRIDGE"
+            "CONFIG_OVERLAY_FS"
+            "CONFIG_SECCOMP"
+            "CONFIG_SECCOMP_FILTER"
+          )
+          
+          # 查找所有 defconfig
+          DEFCONFIGS=$(find arch/arm64/configs -name "*defconfig" 2>/dev/null)
+          
+          if [ -z "$DEFCONFIGS" ]; then
+            echo "No defconfigs found!"
+            exit 1
+          fi
+          
+          ALL_PASS=true
+          
+          for defconfig in $DEFCONFIGS; do
+            echo ""
+            echo "=== Checking: $defconfig ==="
+            MISSING=()
+            
+            for config in "${REQUIRED_CONFIGS[@]}"; do
+              if grep -q "^$config=y" "$defconfig"; then
+                echo "  ✅ $config"
+              else
+                echo "  ❌ $config (MISSING or disabled)"
+                MISSING+=("$config")
+                ALL_PASS=false
+              fi
+            done
+            
+            if [ ${#MISSING[@]} -gt 0 ]; then
+              echo "  ⚠️  Missing ${#MISSING[@]} required configs"
+            fi
+          done
+          
+          echo ""
+          if [ "$ALL_PASS" = true ]; then
+            echo "=== ✅ All Droidspaces required configs are present ==="
+            exit 0
+          else
+            echo "=== ❌ Some required configs are missing ==="
+            echo "Please enable them for Droidspaces support"
+            exit 1
+          fi
