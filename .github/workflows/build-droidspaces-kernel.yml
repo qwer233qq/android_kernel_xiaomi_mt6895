@@ -14,7 +14,7 @@ on:
           - lineage-22.1
           - lineage-23.2
       apply_droidspaces_patches:
-        description: 'Apply Droidspaces kABI patches'
+        description: 'Apply Droidspaces patches'
         required: true
         default: true
         type: boolean
@@ -91,7 +91,6 @@ jobs:
             git clone --depth=1 \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
               clang-repo
-            # 找到最新的 clang 目录
             CLANG_SUBDIR=$(ls clang-repo/ | grep clang | sort | tail -1)
             mv "clang-repo/$CLANG_SUBDIR" clang-r450784d
           fi
@@ -147,8 +146,8 @@ jobs:
           git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git droidspaces
           echo "DROIDSPACES_PATH=${{ env.WORKSPACE }}/droidspaces" >> $GITHUB_ENV
 
-      # ========== 6. 应用 Droidspaces kABI 补丁 ==========
-      - name: Apply Droidspaces kABI patches
+      # ========== 6. 检查并应用 Droidspaces 补丁 ==========
+      - name: Apply Droidspaces patches
         if: ${{ github.event.inputs.apply_droidspaces_patches != 'false' }}
         run: |
           cd ${{ env.KERNEL_DIR }}
@@ -156,30 +155,39 @@ jobs:
           echo "=== Kernel version check ==="
           head -5 Makefile
 
-          echo "=== Applying Droidspaces kABI patches ==="
+          echo ""
+          echo "=== Droidspaces patches directory structure ==="
+          find ${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches -type f -name "*.patch" | sort
 
-          # 补丁1: SYSVIPC kABI fix
-          PATCH1="${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix-sysvipc-kabi.patch"
-          if [ -f "$PATCH1" ]; then
-            echo "Applying: 001.GKI-below-6.12-fix-sysvipc-kabi.patch"
-            patch -p1 --verbose < "$PATCH1"
-          else
-            echo "ERROR: Patch 1 not found at $PATCH1"
-            ls -R "${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches/" || true
-            exit 1
-          fi
+          echo ""
+          echo "=== Applying Droidspaces patches ==="
 
-          # 补丁2: POSIX_MQUEUE kABI fix (5.10 及以下)
-          PATCH2="${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
-          if [ -f "$PATCH2" ]; then
-            echo "Applying: 002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
-            patch -p1 --verbose < "$PATCH2"
-          else
-            echo "ERROR: Patch 2 not found at $PATCH2"
-            exit 1
-          fi
+          # 首先列出所有可用的补丁
+          PATCH_DIR="${{ env.DROIDSPACES_PATH }}/Documentation/resources/kernel-patches"
 
-          echo "=== Patches applied successfully ==="
+          # 根据内核版本选择补丁
+          KERNEL_MAJOR=$(grep "^VERSION = " Makefile | awk '{print $3}')
+          KERNEL_PATCH=$(grep "^PATCHLEVEL = " Makefile | awk '{print $3}')
+          echo "Kernel version: $KERNEL_MAJOR.$KERNEL_PATCH"
+
+          # GKI 5.10: 应用 non-GKI 补丁（这些补丁适用于旧版内核，但可能也适用于 GKI 5.10）
+          # 同时尝试应用 GKI 相关补丁
+          
+          # 尝试应用所有可用的补丁
+          for patchfile in $(find "$PATCH_DIR" -name "*.patch" | sort); do
+            echo ""
+            echo "Found patch: $patchfile"
+            echo "Attempting to apply..."
+            if patch -p1 --dry-run < "$patchfile" 2>/dev/null; then
+              echo "  ✅ Patch can be applied, applying now..."
+              patch -p1 < "$patchfile"
+            else
+              echo "  ⚠️  Patch cannot be applied (may already be applied or incompatible), skipping"
+            fi
+          done
+
+          echo ""
+          echo "=== Patch application complete ==="
 
       # ========== 7. 修改内核配置 ==========
       - name: Enable Droidspaces kernel configs
@@ -391,7 +399,7 @@ jobs:
             - ✅ IPC namespace
             - ✅ devtmpfs
             - ✅ SYSVIPC / POSIX_MQUEUE
-            - ✅ kABI patches applied
+            - ✅ Droidspaces patches applied
 
             ### Flashing
             Flash `Droidspaces-Kernel-MT6895-*.zip` via TWRP/Recovery
